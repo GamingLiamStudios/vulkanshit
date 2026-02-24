@@ -13,8 +13,10 @@
 #include <spdlog/spdlog.h>
 
 #include <map>
-#include <exception>
 #define MAX_EVENTS 10
+
+template<typename T>
+using UniqueCPtr = std::unique_ptr<T, void (*)(T *)>;
 
 struct EventCallback
 {
@@ -40,7 +42,7 @@ public:
     template<typename T>
     void insert(int fd, void (*callback)(int, void *), T *userdata)
     {
-        struct epoll_event ev;
+        epoll_event ev;
         ev.events  = EPOLLIN;
         ev.data.fd = fd;
 
@@ -56,7 +58,7 @@ public:
 
     void dispatch_next()
     {
-        struct epoll_event events[MAX_EVENTS];
+        epoll_event events[MAX_EVENTS];
 
         int nfds = epoll_wait(_epollfd, events, MAX_EVENTS, -1);
         if (nfds == -1) { throw std::system_error(errno, std::system_category()); }
@@ -71,23 +73,74 @@ public:
     }
 };
 
-void registry_handle_global(
-  void               *userdata,
-  struct wl_registry *registry,
-  uint32_t            name,
-  const char         *interface,
-  uint32_t            version)
-{
-    spdlog::debug("Interface: {}: {} (Name {})", interface, version, name);
-}
+class WindowState;
 
-void registry_handle_global_remove(void *userdata, struct wl_registry *registry, uint32_t name)
+class WindowState
 {
-}
+    std::vector<int>          _required_names;
+    UniqueCPtr<wl_compositor> _compositor;
 
-const struct wl_registry_listener registry_listener = {
-    .global        = registry_handle_global,
-    .global_remove = registry_handle_global_remove,
+    static constexpr int wl_compositor_version = 4;
+
+public:
+    bool active;
+
+    WindowState() : _compositor(nullptr, [](wl_compositor *) { }), active(true) { }
+
+    void Close()
+    {
+        _compositor = UniqueCPtr<wl_compositor>(nullptr, [](wl_compositor *) { });
+        active      = false;
+    }
+
+    void RegistryHandleGlobal(
+      wl_registry     *registry,
+      uint32_t         name,
+      std::string_view interface,
+      uint32_t         version) noexcept
+    {
+        spdlog::debug("Global Add -> {}: {} (Name {})", interface, version, name);
+
+        if (interface.compare(wl_compositor_interface.name) == 0)
+        {
+            _compositor = UniqueCPtr<wl_compositor>(
+              static_cast<struct wl_compositor *>(
+                wl_registry_bind(registry, name, &wl_compositor_interface, wl_compositor_version)),
+              wl_compositor_destroy);
+            _required_names.push_back(name);
+        }
+    }
+
+    void RegistryHandleGlobalRemove(wl_registry *, uint32_t name)
+    {
+        if (std::binary_search(_required_names.begin(), _required_names.end(), name))
+        {
+            throw std::runtime_error("Compositor removed required capability");
+        }
+    }
+
+public:
+    static const wl_registry_listener registry_listener;
+};
+
+const wl_registry_listener WindowState::registry_listener = {
+    .global =
+      [](
+        void        *userdata,
+        wl_registry *registry,
+        uint32_t     name,
+        const char  *interface,
+        uint32_t     version)
+    {
+        WindowState *state = static_cast<WindowState *>(userdata);
+        state->RegistryHandleGlobal(registry, name, std::string_view(interface), version);
+    },
+    .global_remove =
+      [](void *userdata, wl_registry *registry, uint32_t name)
+    {
+        WindowState *state = static_cast<WindowState *>(userdata);
+        state->RegistryHandleGlobalRemove(registry, name);
+    },
 };
 
 int main()
@@ -107,9 +160,7 @@ int main()
 
     spdlog::set_level(spdlog::level::debug);
 
-    std::unique_ptr<struct wl_display, void (*)(struct wl_display *)> display(
-      wl_display_connect(nullptr),
-      wl_display_disconnect);
+    UniqueCPtr<wl_display> display(wl_display_connect(nullptr), wl_display_disconnect);
     if (display.get() == nullptr)
     {
         spdlog::error("Failed to connecct to Wayland Server");
@@ -125,15 +176,19 @@ int main()
         return 1;
     }
 
+    WindowState state;
+
     EventLoop el = EventLoop();
     el.insert(
       sigfd,
-      [](int fd, void *)
+      [](int fd, void *userdata)
       {
-          struct signalfd_siginfo siginfo;
+          WindowState *state = static_cast<WindowState *>(userdata);
+
+          signalfd_siginfo siginfo;
           while (true)
           {
-              int res = read(fd, &siginfo, sizeof(struct signalfd_siginfo));
+              int res = read(fd, &siginfo, sizeof(signalfd_siginfo));
               if (res == -1)
               {
                   int errnum = errno;
@@ -142,26 +197,24 @@ int main()
                   throw std::system_error(errnum, std::system_category());
               }
 
-              spdlog::info("Signal captured!");
-
-              // Close safely! ;)
-              exit(EXIT_FAILURE);
+              spdlog::info("Exit signal captured!");
+              state->Close();
           }
       },
-      (void *) nullptr);
+      &state);
     el.insert(
       wl_display_get_fd(display.get()),
-      [](int, void *ptr) { wl_display_dispatch((struct wl_display *) ptr); },
+      [](int, void *ptr) { wl_display_dispatch(static_cast<wl_display *>(ptr)); },
       display.get());
 
-    std::unique_ptr<struct wl_registry, void (*)(struct wl_registry *)> registry(
+    UniqueCPtr<wl_registry> registry(
       wl_display_get_registry(display.get()),
       wl_registry_destroy);    // I think this is safe to do?
 
-    wl_registry_add_listener(registry.get(), &registry_listener, NULL);
+    wl_registry_add_listener(registry.get(), &WindowState::registry_listener, &state);
     wl_display_roundtrip(display.get());
 
-    while (true) { el.dispatch_next(); }
+    while (state.active) { el.dispatch_next(); }
 
     return 0;
 }
