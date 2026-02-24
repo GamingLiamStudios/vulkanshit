@@ -71,6 +71,25 @@ public:
     }
 };
 
+void registry_handle_global(
+  void               *userdata,
+  struct wl_registry *registry,
+  uint32_t            name,
+  const char         *interface,
+  uint32_t            version)
+{
+    spdlog::debug("Interface: {}: {} (Name {})", interface, version, name);
+}
+
+void registry_handle_global_remove(void *userdata, struct wl_registry *registry, uint32_t name)
+{
+}
+
+const struct wl_registry_listener registry_listener = {
+    .global        = registry_handle_global,
+    .global_remove = registry_handle_global_remove,
+};
+
 int main()
 {
     sigset_t mask;
@@ -85,6 +104,8 @@ int main()
 
     spdlog::info("Hello World!");
     spdlog::enable_backtrace(32);
+
+    spdlog::set_level(spdlog::level::debug);
 
     std::unique_ptr<struct wl_display, void (*)(struct wl_display *)> display(
       wl_display_connect(nullptr),
@@ -121,7 +142,7 @@ int main()
                   throw std::system_error(errnum, std::system_category());
               }
 
-              spdlog::error("Signal captured!");
+              spdlog::info("Signal captured!");
 
               // Close safely! ;)
               exit(EXIT_FAILURE);
@@ -132,6 +153,13 @@ int main()
       wl_display_get_fd(display.get()),
       [](int, void *ptr) { wl_display_dispatch((struct wl_display *) ptr); },
       display.get());
+
+    std::unique_ptr<struct wl_registry, void (*)(struct wl_registry *)> registry(
+      wl_display_get_registry(display.get()),
+      wl_registry_destroy);    // I think this is safe to do?
+
+    wl_registry_add_listener(registry.get(), &registry_listener, NULL);
+    wl_display_roundtrip(display.get());
 
     while (true) { el.dispatch_next(); }
 
