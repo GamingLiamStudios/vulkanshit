@@ -1,0 +1,9 @@
+# IDE
+.cache
+.vscode
+.vs
+.idea
+
+# Meson
+/subprojects/*
+!/subprojects/*.wrap
