@@ -152,31 +152,41 @@ public:
 private:
     UniqueCPtr<wl_surface> _surface;
     UniqueCPtr<wl_buffer>  _buffers[buffer_count];
+    uint8_t                _released_buffers;
 
-    // UniqueCPtr<xdg_surface> _xdg_surface;
+    UniqueCPtr<xdg_surface> _xdg_surface;
 
-    void   *_data;
-    int32_t _data_len;
-    int     _active_buffer;
+    void        *_data;
+    std::int32_t _data_len;
+    int          _active_buffer;
 
-    const int32_t _width, _height;
+    const std::int32_t _width, _height;
+
+    std::int32_t  _preferred_scale;
+    std::uint32_t _preferred_transform;
+    // std::set<wl_output> entered;
 
 public:
+    /// Safe as long as pointer doesn't move (static position on stack or Heap-Allocated)
     XDGWindowHandle(
       UniqueCPtr<wl_surface>   surface,
       UniqueCPtr<wl_shm_pool> &shm_pool,    // Dropping the shm_pool doesn't dealloc the memory;
                                             // only dropping the buffers will.
-      void   *data,
-      int32_t data_len,
-      int32_t width,
-      int32_t height)
+      UniqueCPtr<xdg_surface> xdg_surface,
+      void                   *data,
+      std::int32_t            data_len,
+      std::int32_t            width,
+      std::int32_t            height)
         : _surface(std::move(surface)),
-          _buffers { DefaultCPtr<wl_buffer>(), DefaultCPtr<wl_buffer>() }, _data(data),
-          _data_len(data_len), _active_buffer(0), _width(width), _height(height)
+          _buffers { DefaultCPtr<wl_buffer>(), DefaultCPtr<wl_buffer>() },
+          _released_buffers((1 << buffer_count) - 1), _xdg_surface(std::move(xdg_surface)),
+          _data(data), _data_len(data_len), _active_buffer(0), _width(width), _height(height)
     {
+        wl_surface_add_listener(surface.get(), &surface_listener, this);
+
         // Assuming WL_SHM_FORMAT_XRGB8888
         const int32_t stride = width * 4;
-        for (int i = 0; i < buffer_count; i++)
+        for (std::uintptr_t i = 0; i < buffer_count; i++)
         {
             int32_t               offset = stride * height * i;
             UniqueCPtr<wl_buffer> buffer(
@@ -189,17 +199,29 @@ public:
                 WL_SHM_FORMAT_XRGB8888),
               wl_buffer_destroy);
 
+            // TODO: Move buffers into seperate subclass
+            wl_buffer_add_listener(buffer.get(), &buffer_listener, this);
+            wl_buffer_set_user_data(buffer.get(), reinterpret_cast<void *>(i));
+
             _buffers[i] = std::move(buffer);
         }
     }
     ~XDGWindowHandle() { munmap(_data, _data_len); }
 
-    int      ActiveID() { return this->_active_buffer; }
-    uint8_t *ActiveBuffer()
+    int           ActiveID() { return this->_active_buffer; }
+    std::uint8_t *ActiveBuffer()
     {
-        const int32_t stride = this->_width * 4;
-        int32_t       offset = stride * this->_height * this->_active_buffer;
-        return static_cast<uint8_t *>(this->_data) + offset;
+        if ((this->_released_buffers & 1 << this->_active_buffer) == 0)
+        {
+            spdlog::warn(
+              "Compositor hasn't released buffer before it was reused. Maybe increase buffer "
+              "count.");
+            return nullptr;
+        }
+
+        const std::int32_t stride = this->_width * 4;
+        std::int32_t       offset = stride * this->_height * this->_active_buffer;
+        return static_cast<std::uint8_t *>(this->_data) + offset;
     }
 
     void SwapBuffers()
@@ -209,9 +231,84 @@ public:
         wl_surface_damage(this->_surface.get(), 0, 0, this->_width, this->_height);
         wl_surface_commit(this->_surface.get());
 
+        this->_released_buffers &= ~(1 << this->_active_buffer);
+
         this->_active_buffer++;
         if (this->_active_buffer >= buffer_count) { this->_active_buffer = 0; }
     }
+
+private:
+    static const wl_buffer_listener  buffer_listener;
+    static const wl_surface_listener surface_listener;
+};
+
+const wl_buffer_listener XDGWindowHandle::buffer_listener {
+    .release =
+      [](void *userdata, struct wl_buffer *buf)
+    {
+        XDGWindowHandle *handle  = static_cast<XDGWindowHandle *>(userdata);
+        void            *bufdata = wl_buffer_get_user_data(buf);
+        handle->_released_buffers |= 1 << reinterpret_cast<std::uintptr_t>(bufdata);
+    }
+};
+
+const wl_surface_listener XDGWindowHandle::surface_listener = {
+    .enter = [](void *, wl_surface *, wl_output *) {},
+    .leave = [](void *, wl_surface *, wl_output *) {},
+    .preferred_buffer_scale =
+      [](void *userdata, wl_surface *, std::int32_t scale)
+    {
+        XDGWindowHandle *handle  = static_cast<XDGWindowHandle *>(userdata);
+        handle->_preferred_scale = scale;
+    },
+    .preferred_buffer_transform =
+      [](void *userdata, wl_surface *, std::uint32_t transform)
+    {
+        XDGWindowHandle *handle      = static_cast<XDGWindowHandle *>(userdata);
+        handle->_preferred_transform = transform;
+    }
+};
+
+class XDGTopLevelHandle : public XDGWindowHandle
+{
+    UniqueCPtr<xdg_toplevel> _xdg_toplevel;
+
+public:
+    XDGTopLevelHandle(
+      UniqueCPtr<wl_surface>   surface,
+      UniqueCPtr<wl_shm_pool> &shm_pool,    // Dropping the shm_pool doesn't dealloc the memory;
+                                            // only dropping the buffers will.
+      UniqueCPtr<xdg_surface> xdg_surface,
+      void                   *data,
+      std::int32_t            data_len,
+      std::int32_t            width,
+      std::int32_t            height)
+        : XDGWindowHandle(
+            std::move(surface),
+            shm_pool,
+            std::move(xdg_surface),
+            data,
+            data_len,
+            width,
+            height),
+          _xdg_toplevel(DefaultCPtr<xdg_toplevel>())
+    {
+        UniqueCPtr<xdg_toplevel> toplevel(
+          xdg_surface_get_toplevel(xdg_surface.get()),
+          xdg_toplevel_destroy);
+        xdg_toplevel_add_listener(toplevel.get(), &toplevel_listener, this);
+        _xdg_toplevel = std::move(toplevel);
+    }
+
+private:
+    static const xdg_toplevel_listener toplevel_listener;
+};
+
+const xdg_toplevel_listener XDGTopLevelHandle::toplevel_listener {
+    .configure        = [](void *, xdg_toplevel *, std::int32_t, std::int32_t, wl_array *) { },
+    .close            = [](void *, xdg_toplevel *) { },
+    .configure_bounds = [](void *, xdg_toplevel *, std::int32_t, std::int32_t) { },
+    .wm_capabilities  = [](void *, xdg_toplevel *, wl_array *) { },
 };
 
 class WindowState
@@ -286,46 +383,7 @@ public:
         active = false;
     }
 
-    void RegistryHandleGlobal(
-      wl_registry     *registry,
-      uint32_t         name,
-      std::string_view interface,
-      uint32_t         version) noexcept
-    {
-        spdlog::debug("Global Add -> {}: {} (Name {})", interface, version, name);
-
-        if (interface.compare(wl_compositor_interface.name) == 0)
-        {
-            _compositor = UniqueCPtr<wl_compositor>(
-              static_cast<wl_compositor *>(
-                wl_registry_bind(registry, name, &wl_compositor_interface, wl_compositor_version)),
-              wl_compositor_destroy);
-            _required_names.push_back(name);
-        }
-
-        if (interface.compare(wl_shm_interface.name) == 0)
-        {
-            _shm = UniqueCPtr<wl_shm>(
-              static_cast<wl_shm *>(
-                wl_registry_bind(registry, name, &wl_shm_interface, wl_shm_version)),
-              wl_shm_destroy);
-            _required_names.push_back(name);
-        }
-
-        if (interface.compare(xdg_wm_base_interface.name) == 0)
-        {
-            _xdg_base = UniqueCPtr<xdg_wm_base>(
-              static_cast<xdg_wm_base *>(
-                wl_registry_bind(registry, name, &xdg_wm_base_interface, 5)),
-              xdg_wm_base_destroy);
-            _required_names.push_back(name);
-
-            // Attach listener
-            xdg_wm_base_add_listener(_xdg_base.get(), &wm_base_listener, this);
-        }
-    }
-
-    XDGWindowHandle CreateWindow(uint32_t width, uint32_t height)
+    std::unique_ptr<XDGWindowHandle> CreateWindow(uint32_t width, uint32_t height)
     {
         if (this->_compositor.get() == nullptr) { throw WaylandError::MissingRequiredFeatures; }
         if (this->_shm.get() == nullptr) { throw WaylandError::MissingRequiredFeatures; }
@@ -350,18 +408,63 @@ public:
           wl_shm_create_pool(this->_shm.get(), shm_fd, shm_pool_size),
           wl_shm_pool_destroy);
 
-        return XDGWindowHandle(
+        return std::make_unique<XDGWindowHandle>(
           std::move(surface),
           shm_pool,
+          std::move(xdg_surface),
           pool_data,
           shm_pool_size,
           width,
           height);
     }
 
-public:
     static const wl_registry_listener registry_listener;
+
+private:
+    static const wl_shm_listener      shm_listener;
     static const xdg_wm_base_listener wm_base_listener;
+
+    void RegistryHandleGlobal(
+      wl_registry     *registry,
+      uint32_t         name,
+      std::string_view interface,
+      uint32_t         version) noexcept
+    {
+        spdlog::debug("Global Add -> {}: {} (Name {})", interface, version, name);
+
+        if (interface.compare(wl_compositor_interface.name) == 0)
+        {
+            _compositor = UniqueCPtr<wl_compositor>(
+              static_cast<wl_compositor *>(
+                wl_registry_bind(registry, name, &wl_compositor_interface, wl_compositor_version)),
+              wl_compositor_destroy);
+            _required_names.push_back(name);
+        }
+
+        if (interface.compare(wl_shm_interface.name) == 0)
+        {
+            _shm = UniqueCPtr<wl_shm>(
+              static_cast<wl_shm *>(
+                wl_registry_bind(registry, name, &wl_shm_interface, wl_shm_version)),
+              wl_shm_destroy);
+            _required_names.push_back(name);
+
+            // Attach listener
+            wl_shm_add_listener(_shm.get(), &shm_listener, this);
+        }
+
+        if (interface.compare(xdg_wm_base_interface.name) == 0)
+        {
+            _xdg_base = UniqueCPtr<xdg_wm_base>(
+              static_cast<xdg_wm_base *>(
+                wl_registry_bind(registry, name, &xdg_wm_base_interface, 5)),
+              xdg_wm_base_destroy);
+            _required_names.push_back(name);
+
+            // Attach listener
+            xdg_wm_base_add_listener(_xdg_base.get(), &wm_base_listener, this);
+        }
+    }
 };
 
 const wl_registry_listener WindowState::registry_listener = {
@@ -385,6 +488,15 @@ const wl_registry_listener WindowState::registry_listener = {
         {
             throw std::runtime_error("Compositor removed required capability");
         }
+    },
+};
+
+const wl_shm_listener WindowState::shm_listener = {
+    .format =
+      [](void *userdata, wl_shm *shm, uint32_t format)
+    {
+        WindowState *state = static_cast<WindowState *>(userdata);
+        // TODO: Cache these somewhere
     },
 };
 
